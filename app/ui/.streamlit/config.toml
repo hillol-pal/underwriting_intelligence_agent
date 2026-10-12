@@ -1,0 +1,4 @@
+[client]
+# Hide Streamlit developer controls (Deploy, Rerun, Clear cache) on localhost.
+# Viewer controls such as the settings menu stay available.
+toolbarMode = "viewer"
