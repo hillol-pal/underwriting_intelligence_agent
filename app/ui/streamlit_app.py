@@ -1,11 +1,32 @@
 """Streamlit UI for the Claims Investigation Workbench."""
+import logging
 import os
 
 import httpx
 import streamlit as st
 
+from app.core.logutil import event
+
+logger = logging.getLogger("app.ui")
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger.setLevel(logging.INFO)
+
 API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000/api/v1")
 HEALTH_URL = API_BASE.removesuffix("/api/v1") + "/health"
+
+
+def _call(method: str, url: str, **kwargs):
+    files = kwargs.get("files") or {}
+    names = []
+    if isinstance(files, dict):
+        for item in files.values():
+            if isinstance(item, tuple) and item:
+                names.append(item[0])
+    event(logger, "ui request", method=method, url=url, json=kwargs.get("json"), data=kwargs.get("data"), files=names)
+    response = getattr(httpx, method)(url, **kwargs)
+    event(logger, "ui response", method=method, url=url, status=response.status_code, body=response.text)
+    return response
 
 DOCUMENT_TYPES = [
     "Auto-detect",
@@ -51,6 +72,36 @@ def _claim_id() -> str:
     return st.session_state.get("claim_id", "").strip()
 
 
+def _supervisor_caption(claim_id: str) -> str | None:
+    """Caption from the latest run. A 404 leaves the Phase 1 report caption unchanged."""
+    try:
+        response = _call("get", f"{API_BASE}/claims/{claim_id}/investigation", timeout=30)
+    except Exception:
+        return None
+    if response.status_code == 404:
+        return None
+    if response.status_code >= 400:
+        return None
+    body = response.json()
+    caption = (
+        f"Supervisor run {body.get('run_id')}: {body.get('status')}. "
+        "Specialist rows are in the evidence ledger."
+    )
+    if body.get("error"):
+        caption += f" Error: {body['error']}."
+    if body.get("stale_reason"):
+        caption += f" Stale: {body['stale_reason']}."
+    return caption
+
+
+def _unreachable(action: str, exc: Exception) -> None:
+    st.error(
+        f"Failed to {action}: nothing is listening at {API_BASE}. "
+        "Start the API in this repo with `uvicorn app.main:app --reload --port 8000`, "
+        f"then try again. ({exc})"
+    )
+
+
 def _error_detail(response: httpx.Response) -> str:
     try:
         payload = response.json()
@@ -78,7 +129,7 @@ with new_claim:
         submitted = st.form_submit_button("Create claim", type="primary", icon=":material/add:")
     if submitted:
         try:
-            response = httpx.post(
+            response = _call("post", 
                 f"{API_BASE}/claims",
                 json={"policy_number": policy_number or None, "incident_date_claimed": incident_date or None},
                 timeout=30,
@@ -89,6 +140,8 @@ with new_claim:
                 data = response.json()
                 st.session_state["claim_id"] = data["claim"]["claim_id"]
                 st.success(f"Claim created: {data['claim']['claim_id']}")
+        except httpx.ConnectError as exc:
+            _unreachable("create claim", exc)
         except Exception as exc:
             st.error(f"Failed to create claim: {exc}")
 
@@ -100,7 +153,7 @@ with new_claim:
     if st.button("Load September collision pack", icon=":material/folder_open:"):
         try:
             with st.spinner("Reading the September pack"):
-                response = httpx.post(f"{API_BASE}/demo/september-collision", timeout=180)
+                response = _call("post", f"{API_BASE}/demo/september-collision", timeout=180)
             if response.status_code >= 400:
                 st.error(_error_detail(response))
             else:
@@ -109,6 +162,8 @@ with new_claim:
                 st.success(
                     f"Claim {data['claim']['claim_id']} has {data['documents']} documents and {data['findings']} ledger rows."
                 )
+        except httpx.ConnectError as exc:
+            _unreachable("load the pack", exc)
         except Exception as exc:
             st.error(f"Failed to load the pack: {exc}")
 
@@ -135,7 +190,7 @@ with documents:
                 for upload in uploads:
                     document_type = None if chosen_type == "Auto-detect" or len(uploads) > 1 else chosen_type
                     try:
-                        response = httpx.post(
+                        response = _call("post", 
                             f"{API_BASE}/claims/{claim_id}/documents",
                             files={"file": (upload.name, upload.getvalue(), "application/pdf")},
                             data={"document_type": document_type} if document_type else None,
@@ -153,7 +208,7 @@ with documents:
                         st.error(f"{upload.name}: {exc}")
         st.button("Refresh document list", icon=":material/refresh:")
         try:
-            response = httpx.get(f"{API_BASE}/claims/{claim_id}/documents", timeout=30)
+            response = _call("get", f"{API_BASE}/claims/{claim_id}/documents", timeout=30)
             if response.status_code == 200:
                 rows = response.json()
                 if rows:
@@ -206,7 +261,7 @@ with search:
                     "k": 8,
                 }
                 try:
-                    response = httpx.post(f"{API_BASE}/claims/{claim_id}/search", json=payload, timeout=60)
+                    response = _call("post", f"{API_BASE}/claims/{claim_id}/search", json=payload, timeout=60)
                     if response.status_code >= 400:
                         st.error(_error_detail(response))
                     else:
@@ -241,10 +296,35 @@ with ledger:
         st.write("Rows come from the documents that were read. Sample rows replace them and are not taken from a PDF.")
         with st.container(horizontal=True):
             load_findings = st.button("Load findings", type="primary", icon=":material/list:")
+            run_investigation = st.button("Run investigation", icon=":material/account_tree:")
             load_sample = st.button("Load Phase 0 sample rows", icon=":material/science:")
+        if run_investigation:
+            try:
+                response = _call("post", f"{API_BASE}/claims/{claim_id}/investigate", timeout=180)
+                if response.status_code == 409:
+                    st.error("An investigation is already running.")
+                elif response.status_code == 503:
+                    st.error(_error_detail(response))
+                elif response.status_code == 504:
+                    st.warning(
+                        "The server is still finishing the run. The ledger updates when the run row leaves running."
+                    )
+                elif response.status_code >= 400:
+                    st.error(_error_detail(response))
+                else:
+                    details = (response.json() or {}).get("details") or {}
+                    st.write(f"Supervisor: {details.get('supervisor')}.")
+                    if details.get("run_id"):
+                        st.write(f"Run {details['run_id']}")
+                    steps = details.get("steps") or []
+                    if steps:
+                        st.write(", ".join(f"{step.get('step_id')}: {step.get('status')}" for step in steps))
+                    load_findings = True
+            except Exception as exc:
+                st.error(f"Could not run the investigation: {exc}")
         if load_sample:
             try:
-                response = httpx.post(f"{API_BASE}/claims/{claim_id}/seed-example", timeout=30)
+                response = _call("post", f"{API_BASE}/claims/{claim_id}/seed-example", timeout=30)
                 if response.status_code >= 400:
                     st.error(_error_detail(response))
                 else:
@@ -254,7 +334,7 @@ with ledger:
                 st.error(f"Could not load sample rows: {exc}")
         if load_findings:
             try:
-                response = httpx.get(f"{API_BASE}/claims/{claim_id}/findings", timeout=30)
+                response = _call("get", f"{API_BASE}/claims/{claim_id}/findings", timeout=30)
                 if response.status_code >= 400:
                     st.error(_error_detail(response))
                 else:
@@ -270,6 +350,8 @@ with ledger:
                         "Fact": finding["claim_or_policy_fact"],
                         "Value": finding.get("normalized_value") or "",
                         "Status": finding["verification_status"],
+                        "Origin": finding.get("origin") or "",
+                        "Specialist": finding.get("specialist") or "",
                         "Page": finding.get("page_number") or "",
                         "Confidence": finding["confidence"],
                     }
@@ -301,12 +383,13 @@ with report:
         st.write("The report recommends a next action. It does not reject the claim or authorise payment.")
         if st.button("Load report", type="primary", icon=":material/description:"):
             try:
-                response = httpx.get(f"{API_BASE}/claims/{claim_id}/report", timeout=30)
+                response = _call("get", f"{API_BASE}/claims/{claim_id}/report", timeout=30)
                 if response.status_code >= 400:
                     st.error(_error_detail(response))
                 else:
                     loaded_report = response.json()
                     loaded_report["_claim_id"] = claim_id
+                    loaded_report["_supervisor_caption"] = _supervisor_caption(claim_id)
                     st.session_state["report"] = loaded_report
             except Exception as exc:
                 st.error(f"Could not load the report: {exc}")
@@ -314,6 +397,8 @@ with report:
         if loaded and loaded.get("_claim_id") != claim_id:
             loaded = None
         if loaded:
+            if loaded.get("_supervisor_caption"):
+                st.caption(loaded["_supervisor_caption"])
             st.subheader("Coverage analysis")
             st.write(loaded["coverage_analysis"])
             st.subheader("Evidence gaps")
@@ -330,7 +415,7 @@ with st.sidebar:
     st.header("Claim")
     st.text_input("Claim id", key="claim_id")
     try:
-        health = httpx.get(HEALTH_URL, timeout=2)
+        health = _call("get", HEALTH_URL, timeout=2)
         if health.status_code == 200:
             body = health.json()
             database = body.get("database", "unknown")
@@ -339,4 +424,7 @@ with st.sidebar:
             st.write("API: unexpected response.")
     except Exception:
         st.write(f"API: not reachable at {HEALTH_URL}.")
-    st.caption("Phase 1 reads PDFs into the evidence ledger and searches clauses with page citations.")
+    st.caption(
+        "Documents are read into the evidence ledger. Run investigation asks the supervisor to add specialist rows. "
+        "A person decides coverage, fraud, and payment."
+    )

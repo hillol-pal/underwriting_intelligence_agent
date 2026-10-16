@@ -30,3 +30,24 @@ def iso_date(value: str) -> str | None:
     if parsed is None:
         return None
     return parsed.isoformat()
+
+
+def compare_dates(left: str, right: str) -> str:
+    """Return before, equal, after, or unparsed. The model does not decide this."""
+    left_date = parse_display_date(left or "")
+    right_date = parse_display_date(right or "")
+    if left_date is None or right_date is None:
+        return "unparsed"
+    if left_date < right_date:
+        return "before"
+    if left_date > right_date:
+        return "after"
+    return "equal"
+
+
+def compare_dates_result(left: str, right: str) -> dict:
+    return {
+        "left_iso": iso_date(left or ""),
+        "right_iso": iso_date(right or ""),
+        "order": compare_dates(left, right),
+    }

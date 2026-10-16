@@ -1,7 +1,7 @@
 """Core domain models and Evidence Ledger schemas."""
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -41,6 +41,9 @@ class Finding(BaseModel):
     next_action: Optional[str] = None
     responsible_reviewer: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    origin: Literal["extraction", "specialist", "seed"] = "extraction"
+    specialist: Optional[str] = None
+    run_id: Optional[str] = None
 
 
 class ClaimStatus(str, Enum):
@@ -105,3 +108,25 @@ class SearchResponse(BaseModel):
     hits: list[SearchHit]
     evidence_sufficient: bool
     note: Optional[str] = None
+
+
+class InvestigationStepView(BaseModel):
+    step_id: str
+    specialist: str
+    status: str
+    skip_reason: Optional[str] = None
+
+
+class InvestigationRunView(BaseModel):
+    run_id: str
+    claim_id: str
+    status: str
+    plan_id: str
+    supervisor_model: str
+    specialist_model: str
+    steps: list[InvestigationStepView]
+    findings_added: int
+    error: Optional[str] = None
+    stale_reason: Optional[str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None

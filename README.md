@@ -16,7 +16,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-docker compose up -d postgres
+docker compose up -d postgres mlflow
 
 # API
 uvicorn app.main:app --reload --port 8000
@@ -37,12 +37,19 @@ docker compose up --build
 - API: http://localhost:8000
 - API docs: http://localhost:8000/docs
 - Health: http://localhost:8000/health
+- MLflow: http://localhost:5001
 
 On **New claim**, press **Load September collision pack**. Then open **Evidence ledger** and **Search**.
 
 ## Embeddings
 
-`EMBEDDING_PROVIDER=auto` calls xAI `POST /v1/embeddings` with model `v1` when `XAI_API_KEY` is set. With no key, ingestion uses a local hashing embedding so lexical search and the evidence ledger still run. Set `EMBEDDING_PROVIDER=xai` to require the API. Date comparisons and money checks never call a model.
+`EMBEDDING_PROVIDER=auto` uses OpenAI `text-embedding-3-small` at 256 dimensions when `OPENAI_API_KEY` is set. With no OpenAI key it uses xAI when `XAI_API_KEY` is set, and otherwise a local hashing embedding. Set `EMBEDDING_PROVIDER=openai` to require OpenAI. Date comparisons and money checks never call a model.
+
+Agent chat is a separate setting. `LLM_PROVIDER` must be `openai`. The supervisor uses `LLM_MODEL` and the four specialists use `LLM_SPECIALIST_MODEL`. Embeddings stay on the 256-dimension pgvector column. Do not point `EMBEDDING_MODEL` at `text-embedding-3-small` or `text-embedding-3-large`. The investigation agent stays off until `INVESTIGATION_AGENT_ENABLED=true`.
+
+## Observability
+
+MLflow runs in Docker on http://localhost:5001 (port 5000 is macOS AirPlay). Loading the September collision pack writes a trace to the `underwriting-intelligence-agent` experiment. OpenAI embedding calls are child spans. The API reads `.env` again when the process starts, so a change to the key or `MLFLOW_TRACKING_URI` applies on the next start. Inside Compose, the API uses `http://mlflow:5000`.
 
 ## Evaluate
 
@@ -58,16 +65,15 @@ That loads the 8 synthetic claims (32 PDFs) into the database from `.env` and pr
 - `app/ui/` — Streamlit workbench
 - `app/corpus/` — labeled synthetic motor claims and PDF builder
 - `app/services/` — ingestion, chunking, hybrid retrieval, extraction, ledger
-- `app/agents/` — supervisor and specialist stubs for Phase 2
+- `app/agents/` — Deep Agent supervisor and the policy, evidence, contradiction, and loss specialists
 - `app/core/` — evidence-ledger models and config
 
 ## Current status
 
-Phase 1 is in place: PDF ingestion, optional Tesseract OCR, section-aware chunks, pgvector plus PostgreSQL full-text search, metadata filters, a coverage bundle that also returns the exclusion, endorsement, and insured-period definition, and ledger rows with quotes and pages.
+Phase 1 reads PDFs into the evidence ledger. Phase 2 adds the supervisor and four specialists behind `INVESTIGATION_AGENT_ENABLED`. Chat completions use OpenAI. Embeddings stay 256-dimensional. The supervisor does not grant cover, decide fraud, or authorise payment. `human_review_required` stays true. The path is drawn in [docs/phase-2-flow.md](docs/phase-2-flow.md).
 
 ## Next steps
 
-1. Wire the Deep Agent supervisor and the specialist roles.
-2. Add reranking, query expansion, and parent-child retrieval beyond the surrounding clause.
-3. Add LangGraph checkpointing and a human approval gate.
-4. Add regression evaluations for prompt injection hidden in PDFs.
+1. Add reranking, query expansion, and parent-child retrieval beyond the surrounding clause.
+2. Add a prompt-injection regression corpus. The specialist tools already wrap page text as untrusted data.
+3. Leave LangGraph checkpointing and an in-app approval gate for a later phase. The reviewer still decides outside this application.

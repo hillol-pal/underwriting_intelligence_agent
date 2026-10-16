@@ -1,13 +1,20 @@
 """API routes for claim investigation."""
+import asyncio
+import logging
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.core.models import Claim, DocumentSummary, Finding, InvestigationReport, SearchResponse
+from app.agents.models import AgentConfigError
+from app.core.config import settings
+from app.core.models import Claim, DocumentSummary, Finding, InvestigationReport, InvestigationRunView, SearchResponse
 from app.services.investigation import IngestError, InvestigationService
-from app.services.store import DatabaseUnavailable
+from app.services.store import DatabaseUnavailable, InvestigationInProgress
+from app.services.tracing import observation, set_outputs
 
 router = APIRouter()
 investigation_service = InvestigationService()
+logger = logging.getLogger("app.api")
 
 
 class CreateClaimRequest(BaseModel):
@@ -40,34 +47,61 @@ def _unavailable(exc: DatabaseUnavailable) -> HTTPException:
     return HTTPException(status_code=503, detail=str(exc))
 
 
+def _running(exc: InvestigationInProgress) -> HTTPException:
+    return HTTPException(status_code=409, detail=str(exc))
+
+
+def _redact_config(exc: AgentConfigError) -> str:
+    text = str(exc)
+    key = settings.openai_api_key or ""
+    if key and key in text:
+        text = text.replace(key, "[redacted]")
+    return text
+
+
 @router.post("/claims", response_model=CreateClaimResponse)
 async def create_claim(request: CreateClaimRequest):
     """Create a claim. Documents are read after they are uploaded."""
-    try:
-        claim = investigation_service.create_claim(
-            policy_number=request.policy_number,
-            incident_date_claimed=request.incident_date_claimed,
-        )
-    except DatabaseUnavailable as exc:
-        raise _unavailable(exc) from exc
-    return CreateClaimResponse(claim=claim, message="Claim created. Upload documents to start the investigation.")
+    with observation("POST /claims", {"policy_number": request.policy_number}) as span:
+        try:
+            claim = investigation_service.create_claim(
+                policy_number=request.policy_number,
+                incident_date_claimed=request.incident_date_claimed,
+            )
+        except DatabaseUnavailable as exc:
+            raise _unavailable(exc) from exc
+        set_outputs(span, {"claim_id": claim.claim_id, "status": claim.status.value})
+        logger.info("claim created claim_id=%s policy_number=%s", claim.claim_id, claim.policy_number)
+        return CreateClaimResponse(claim=claim, message="Claim created. Upload documents to start the investigation.")
 
 
 @router.post("/demo/september-collision", response_model=DemoResponse)
 async def load_september_collision():
     """Create the labeled September collision claim and ingest its document pack."""
-    try:
-        claim = investigation_service.load_september_pack()
-        documents = investigation_service.list_documents(claim.claim_id)
-        findings = investigation_service.get_findings(claim.claim_id)
-    except DatabaseUnavailable as exc:
-        raise _unavailable(exc) from exc
-    return DemoResponse(
-        claim=claim,
-        documents=len(documents),
-        findings=len(findings),
-        message="September collision pack ingested. Coverage stays pending human review.",
-    )
+    with observation("POST /demo/september-collision") as span:
+        try:
+            claim = investigation_service.load_september_pack()
+            documents = investigation_service.list_documents(claim.claim_id)
+            findings = investigation_service.get_findings(claim.claim_id)
+        except DatabaseUnavailable as exc:
+            raise _unavailable(exc) from exc
+        response = DemoResponse(
+            claim=claim,
+            documents=len(documents),
+            findings=len(findings),
+            message="September collision pack ingested. Coverage stays pending human review.",
+        )
+        set_outputs(
+            span,
+            {
+                "claim_id": claim.claim_id,
+                "status": claim.status.value,
+                "policy_number": claim.policy_number,
+                "documents": response.documents,
+                "findings": response.findings,
+            },
+        )
+        return response
 
 
 @router.post("/claims/{claim_id}/documents", response_model=DocumentSummary)
@@ -95,6 +129,8 @@ async def upload_document(
         )
     except DatabaseUnavailable as exc:
         raise _unavailable(exc) from exc
+    except InvestigationInProgress as exc:
+        raise _running(exc) from exc
     except IngestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -168,18 +204,51 @@ async def seed_example(claim_id: str):
         findings = investigation_service.seed_example(claim_id)
     except DatabaseUnavailable as exc:
         raise _unavailable(exc) from exc
+    except InvestigationInProgress as exc:
+        raise _running(exc) from exc
     except IngestError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"claim_id": claim_id, "findings": len(findings), "message": "Sample ledger rows loaded."}
 
 
-@router.post("/claims/{claim_id}/investigate")
-async def trigger_investigation(claim_id: str):
-    """Mark the claim ready for human review. This does not decide coverage."""
+@router.get("/claims/{claim_id}/investigation", response_model=InvestigationRunView)
+async def get_investigation(claim_id: str):
+    """Return the latest supervisor run. Raw specialist JSON stays in the database."""
     try:
-        result = investigation_service.run_investigation(claim_id)
+        if investigation_service.get_claim(claim_id) is None:
+            raise HTTPException(status_code=404, detail="Claim not found")
+        run = investigation_service.get_investigation(claim_id)
     except DatabaseUnavailable as exc:
         raise _unavailable(exc) from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="No investigation run")
+    return run
+
+
+@router.post("/claims/{claim_id}/investigate")
+async def trigger_investigation(claim_id: str):
+    """Run the supervisor when the feature flag is on. This does not decide coverage.
+
+    ``wait_for`` cancels the await. It does not kill the worker thread.
+    """
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(investigation_service.run_investigation, claim_id),
+            timeout=180,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="The server is still finishing the run. The ledger updates when the run row leaves running.",
+        ) from exc
+    except DatabaseUnavailable as exc:
+        raise _unavailable(exc) from exc
+    except InvestigationInProgress as exc:
+        raise _running(exc) from exc
+    except AgentConfigError as exc:
+        raise HTTPException(status_code=503, detail=_redact_config(exc)) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="Claim not found")
+    if not settings.investigation_agent_enabled:
+        result = {**result, "supervisor": "disabled"}
     return {"claim_id": claim_id, "status": "investigation_triggered", "details": result}

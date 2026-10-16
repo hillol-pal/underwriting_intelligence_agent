@@ -57,4 +57,4 @@ Build order
 8. Wire the existing API and UI. Persist uploads, fill the ledger from extraction, and add a retrieval panel. Leave the Phase 0 seeded path available only as an explicit demo.
 9. Evaluation. Run the labeled questions and fail the build if a cited page does not contain the quoted text.
 
-The current modules stay where they are. New work belongs in ingestion, retrieval, and extraction services, with app/api/routes.py and app/ui/streamlit_app.py calling them. InvestigationSupervisor stays a stub until Phase 2
+The current modules stay where they are. New work belongs in ingestion, retrieval, and extraction services, with app/api/routes.py and app/ui/streamlit_app.py calling them. Phase 2 wires InvestigationSupervisor through the Deep Agent specialists. The run stays advisory: see docs/phase-2-design.md and docs/phase-2-flow.md.

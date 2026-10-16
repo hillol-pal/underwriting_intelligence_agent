@@ -20,7 +20,10 @@ def _coverage_paragraph(findings: list[Finding]) -> str:
     extras = [
         finding.normalized_value
         for finding in findings
-        if finding.finding_type == FindingType.POLICY_FACT and finding.normalized_value and "endorsement" in finding.claim_or_policy_fact.lower()
+        if finding.finding_type == FindingType.POLICY_FACT
+        and finding.normalized_value
+        and "endorsement" in finding.claim_or_policy_fact.lower()
+        and (finding.origin or "extraction") == "extraction"
     ]
     return " ".join(part for part in [base, *extras] if part)
 

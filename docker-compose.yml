@@ -25,12 +25,39 @@ services:
       - .env
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/underwriting_agent
+      MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
       - ./app:/app/app
       - uploads:/app/data/uploads
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       - postgres
+      - mlflow
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.17.1
+    ports:
+      - "5001:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: sqlite:////mlflow/mlflow.db
+    volumes:
+      - mlflow-data:/mlflow
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --default-artifact-root
+      - /mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
   ui:
     build: .
@@ -49,3 +76,4 @@ services:
 volumes:
   pgdata:
   uploads:
+  mlflow-data:

@@ -3,11 +3,15 @@
 Dates, money, and coverage status come from ordinary code. A conflict stays unresolved.
 Nothing in this module rejects a claim.
 """
+import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from app.core.logutil import event
 from app.core.models import Finding, FindingType, VerificationStatus
+
+logger = logging.getLogger("app.extraction")
 from app.services.dates import (
     CLAIMED_INCIDENT_RE,
     INCEPTION_RE,
@@ -55,8 +59,18 @@ def _money(line: str) -> Decimal | None:
     return Decimal(match.group(1).replace(",", "")).quantize(Decimal("0.01"))
 
 
+def parse_gbp(text: str) -> Decimal | None:
+    """Public name for the estimate-line parser. `_money` stays the alias."""
+    return _money(text)
+
+
 def _gbp(amount: Decimal) -> str:
     return f"£{amount:.2f}"
+
+
+def format_gbp(amount: Decimal) -> str:
+    """Public name for the ledger spelling. `_gbp` stays the alias."""
+    return _gbp(amount)
 
 
 def _fact(
@@ -371,4 +385,21 @@ def extract_findings(claim_id: str, pages: list[SourcePage]) -> list[Finding]:
             if summary:
                 findings.append(summary)
 
+    event(
+        logger,
+        "findings extracted",
+        claim_id=claim_id,
+        count=len(findings),
+        findings=[
+            {
+                "type": finding.finding_type.value,
+                "fact": finding.claim_or_policy_fact,
+                "value": finding.normalized_value,
+                "page": finding.page_number,
+                "quote": finding.quoted_source_text,
+                "status": finding.verification_status.value,
+            }
+            for finding in findings
+        ],
+    )
     return findings
